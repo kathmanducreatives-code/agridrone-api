@@ -1,9 +1,10 @@
 import os
-import io
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+import cv2
+import numpy as np
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from dotenv import load_dotenv
@@ -25,6 +26,7 @@ app.add_middleware(
 
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "./models"))
 MODEL_GDRIVE_ID = os.getenv("MODEL_GDRIVE_ID", "").strip()
+VALID_CROPS = ["rice", "wheat", "maize", "potato", "tomato", "pepper"]
 
 def _download_model_from_gdrive(model_path: Path) -> bool:
     """Downloads the model file from Google Drive if MODEL_GDRIVE_ID is set."""
@@ -99,7 +101,7 @@ def root():
 def health():
     models_loaded = list(loaded_models.keys())
     available_models = []
-    for crop in ["rice", "wheat", "maize", "potato", "tomato", "pepper"]:
+    for crop in VALID_CROPS:
         onnx = MODELS_DIR / f"{crop}_disease_best.onnx"
         pt   = MODELS_DIR / f"{crop}_disease_best.pt"
         if onnx.exists() or pt.exists():
@@ -111,32 +113,61 @@ def health():
     }
 
 
-@app.post("/predict")
+def _normalize_crop(crop: str) -> tuple[str, Optional[str]]:
+    normalized_crop = (crop or "rice").strip().lower()
+    if normalized_crop in VALID_CROPS:
+        return normalized_crop, None
+    return "rice", f"Unsupported crop '{crop}'. Falling back to 'rice'."
+
+
+def _decode_raw_image(body: bytes) -> Image.Image:
+    if not body:
+        raise HTTPException(status_code=400, detail="Request body is empty")
+
+    np_buffer = np.frombuffer(body, np.uint8)
+    frame = cv2.imdecode(np_buffer, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Failed to decode JPEG image from request body")
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb_frame)
+
+
+@app.post(
+    "/predict",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "image/jpeg": {
+                    "schema": {
+                        "type": "string",
+                        "format": "binary"
+                    }
+                }
+            }
+        }
+    }
+)
 async def predict(
-    image: UploadFile = File(...),
+    request: Request,
     crop: str = Query(default="rice", description="Crop type: rice, wheat, maize, potato, tomato, pepper"),
-    confidence: float = Query(default=0.3, description="Minimum confidence threshold")
+    confidence: float = Query(default=0.3, description="Minimum confidence threshold"),
+    save_to_firebase: bool = Query(default=True, description="Whether to save results to Firebase if configured.")
 ):
-    # Validate crop
-    valid_crops = ["rice", "wheat", "maize", "potato", "tomato", "pepper"]
-    if crop not in valid_crops:
-        raise HTTPException(status_code=400, detail=f"Invalid crop. Choose from: {valid_crops}")
-    
-    # Validate image
-    if not image.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+    normalized_crop, crop_warning = _normalize_crop(crop)
     
     # Load model
-    model = get_model(crop)
+    model = get_model(normalized_crop)
     if model is None:
         raise HTTPException(
             status_code=503,
-            detail=f"Model for '{crop}' not available yet. Training in progress."
+            detail=f"Model for '{normalized_crop}' not available yet. Training in progress."
         )
     
-    # Read and process image
-    img_bytes = await image.read()
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    # Read and process raw JPEG bytes
+    body = await request.body()
+    img = _decode_raw_image(body)
     
     # Run inference
     results = model(img, conf=confidence)[0]
@@ -164,13 +195,17 @@ async def predict(
     primary = detections[0] if detections else None
     
     return {
-        "crop": crop,
+        "crop": normalized_crop,
+        "crop_requested": crop,
+        "crop_warning": crop_warning,
         "disease": primary["disease"] if primary else "Healthy",
         "confidence": primary["confidence"] if primary else 1.0,
         "severity": primary["severity"] if primary else "none",
         "all_detections": detections,
         "image_size": {"width": img.width, "height": img.height},
-        "model": f"{crop}_disease"
+        "model": f"{normalized_crop}_disease",
+        "save_to_firebase_requested": save_to_firebase,
+        "request_content_type": request.headers.get("content-type", "")
     }
 
 
