@@ -141,6 +141,10 @@ async def predict(
     save_to_firebase: bool = Query(default=True, description="Whether to save results to Firebase if configured.")
 ):
     normalized_crop, crop_warning = _normalize_crop(crop)
+
+    # Read and process raw JPEG bytes before any downstream inference checks.
+    body = await request.body()
+    img = _decode_raw_image(body)
     
     # Load model
     model = get_model(normalized_crop)
@@ -149,10 +153,6 @@ async def predict(
             status_code=503,
             detail=f"Model for '{normalized_crop}' not available yet. Training in progress."
         )
-    
-    # Read and process raw JPEG bytes
-    body = await request.body()
-    img = _decode_raw_image(body)
     
     # Run inference
     results = model(img, conf=confidence)[0]
