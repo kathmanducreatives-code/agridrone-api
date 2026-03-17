@@ -133,22 +133,7 @@ def _decode_raw_image(body: bytes) -> Image.Image:
     return Image.fromarray(rgb_frame)
 
 
-@app.post(
-    "/predict",
-    openapi_extra={
-        "requestBody": {
-            "required": True,
-            "content": {
-                "image/jpeg": {
-                    "schema": {
-                        "type": "string",
-                        "format": "binary"
-                    }
-                }
-            }
-        }
-    }
-)
+@app.post("/predict")
 async def predict(
     request: Request,
     crop: str = Query(default="rice", description="Crop type: rice, wheat, maize, potato, tomato, pepper"),
