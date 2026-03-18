@@ -1,11 +1,13 @@
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from PIL import Image
 from dotenv import load_dotenv
 
@@ -26,6 +28,9 @@ app.add_middleware(
 
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "./models"))
 MODEL_GDRIVE_ID = os.getenv("MODEL_GDRIVE_ID", "").strip()
+DEBUG_DIR = Path(os.getenv("DEBUG_IMAGE_DIR", "./debug"))
+DEBUG_LATEST_IMAGE_URL = "/debug/latest.jpg"
+DEBUG_LATEST_DECODED_IMAGE_URL = "/debug/latest_decoded.jpg"
 VALID_CROPS = ["rice", "wheat", "maize", "potato", "tomato", "pepper"]
 
 def _download_model_from_gdrive(model_path: Path) -> bool:
@@ -133,6 +138,131 @@ def _decode_raw_image(body: bytes) -> Image.Image:
     return Image.fromarray(rgb_frame)
 
 
+def _debug_path(name: str) -> Path:
+    return DEBUG_DIR / name
+
+
+def _save_debug_images(raw_bytes: bytes, img: Image.Image) -> bool:
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+
+        _debug_path(f"{stamp}.jpg").write_bytes(raw_bytes)
+        _debug_path("latest.jpg").write_bytes(raw_bytes)
+
+        decoded_path = _debug_path(f"{stamp}_decoded.jpg")
+        latest_decoded_path = _debug_path("latest_decoded.jpg")
+        img.save(decoded_path, format="JPEG")
+        img.save(latest_decoded_path, format="JPEG")
+        return True
+    except Exception as exc:
+        print(f"⚠️ Failed to save debug images: {exc}")
+        return False
+
+
+def _run_inference(img: Image.Image, crop: str, confidence: float) -> tuple[list[dict], Optional[dict]]:
+    model = get_model(crop)
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model for '{crop}' not available yet. Training in progress."
+        )
+
+    results = model(img, conf=confidence)[0]
+
+    detections = []
+    if results.boxes and len(results.boxes) > 0:
+        for box in results.boxes:
+            class_id = int(box.cls[0])
+            conf_score = float(box.conf[0])
+            class_name = results.names[class_id]
+            bbox = box.xyxy[0].tolist()
+
+            detections.append({
+                "disease": class_name,
+                "confidence": round(conf_score, 4),
+                "bbox": [round(x, 2) for x in bbox],
+                "severity": _get_severity(conf_score)
+            })
+
+    detections.sort(key=lambda x: x["confidence"], reverse=True)
+    primary = detections[0] if detections else None
+    return detections, primary
+
+
+def _build_prediction_response(
+    *,
+    crop: str,
+    crop_requested: str,
+    crop_warning: Optional[str],
+    img: Image.Image,
+    detections: list[dict],
+    primary: Optional[dict],
+    request_content_type: str,
+    save_to_firebase: bool,
+    debug_saved: bool,
+) -> dict:
+    return {
+        "status": "success",
+        "crop": crop,
+        "crop_requested": crop_requested,
+        "crop_warning": crop_warning,
+        "disease": primary["disease"] if primary else "Healthy",
+        "confidence": primary["confidence"] if primary else 1.0,
+        "severity": primary["severity"] if primary else "none",
+        "all_detections": detections,
+        "image_size": {"width": img.width, "height": img.height},
+        "model": f"{crop}_disease",
+        "save_to_firebase_requested": save_to_firebase,
+        "firebase_saved": False,
+        "debug_saved": debug_saved,
+        "debug_latest_image_url": DEBUG_LATEST_IMAGE_URL,
+        "debug_latest_decoded_image_url": DEBUG_LATEST_DECODED_IMAGE_URL,
+        "request_content_type": request_content_type,
+    }
+
+
+def _process_prediction(
+    *,
+    raw_bytes: bytes,
+    crop: str,
+    confidence: float,
+    save_to_firebase: bool,
+    request_content_type: str,
+) -> dict:
+    normalized_crop, crop_warning = _normalize_crop(crop)
+    img = _decode_raw_image(raw_bytes)
+    detections, primary = _run_inference(img, normalized_crop, confidence)
+    debug_saved = _save_debug_images(raw_bytes, img)
+    return _build_prediction_response(
+        crop=normalized_crop,
+        crop_requested=crop,
+        crop_warning=crop_warning,
+        img=img,
+        detections=detections,
+        primary=primary,
+        request_content_type=request_content_type,
+        save_to_firebase=save_to_firebase,
+        debug_saved=debug_saved,
+    )
+
+
+@app.get(DEBUG_LATEST_IMAGE_URL)
+def debug_latest_image():
+    latest_path = _debug_path("latest.jpg")
+    if not latest_path.exists():
+        raise HTTPException(status_code=404, detail="No debug image has been saved yet.")
+    return FileResponse(latest_path, media_type="image/jpeg")
+
+
+@app.get(DEBUG_LATEST_DECODED_IMAGE_URL)
+def debug_latest_decoded_image():
+    latest_decoded_path = _debug_path("latest_decoded.jpg")
+    if not latest_decoded_path.exists():
+        raise HTTPException(status_code=404, detail="No decoded debug image has been saved yet.")
+    return FileResponse(latest_decoded_path, media_type="image/jpeg")
+
+
 @app.post("/predict")
 async def predict(
     request: Request,
@@ -140,58 +270,31 @@ async def predict(
     confidence: float = Query(default=0.3, description="Minimum confidence threshold"),
     save_to_firebase: bool = Query(default=True, description="Whether to save results to Firebase if configured.")
 ):
-    normalized_crop, crop_warning = _normalize_crop(crop)
-
-    # Read and process raw JPEG bytes before any downstream inference checks.
     body = await request.body()
-    img = _decode_raw_image(body)
-    
-    # Load model
-    model = get_model(normalized_crop)
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Model for '{normalized_crop}' not available yet. Training in progress."
-        )
-    
-    # Run inference
-    results = model(img, conf=confidence)[0]
-    
-    # Parse results
-    detections = []
-    if results.boxes and len(results.boxes) > 0:
-        for box in results.boxes:
-            class_id   = int(box.cls[0])
-            conf_score = float(box.conf[0])
-            class_name = results.names[class_id]
-            bbox       = box.xyxy[0].tolist()
-            
-            detections.append({
-                "disease": class_name,
-                "confidence": round(conf_score, 4),
-                "bbox": [round(x, 2) for x in bbox],
-                "severity": _get_severity(conf_score)
-            })
-    
-    # Sort by confidence
-    detections.sort(key=lambda x: x["confidence"], reverse=True)
-    
-    # Primary result
-    primary = detections[0] if detections else None
-    
-    return {
-        "crop": normalized_crop,
-        "crop_requested": crop,
-        "crop_warning": crop_warning,
-        "disease": primary["disease"] if primary else "Healthy",
-        "confidence": primary["confidence"] if primary else 1.0,
-        "severity": primary["severity"] if primary else "none",
-        "all_detections": detections,
-        "image_size": {"width": img.width, "height": img.height},
-        "model": f"{normalized_crop}_disease",
-        "save_to_firebase_requested": save_to_firebase,
-        "request_content_type": request.headers.get("content-type", "")
-    }
+    return _process_prediction(
+        raw_bytes=body,
+        crop=crop,
+        confidence=confidence,
+        save_to_firebase=save_to_firebase,
+        request_content_type=request.headers.get("content-type", ""),
+    )
+
+
+@app.post("/predict_form")
+async def predict_form(
+    image: UploadFile = File(...),
+    crop: str = Query(default="rice", description="Crop type: rice, wheat, maize, potato, tomato, pepper"),
+    confidence: float = Query(default=0.3, description="Minimum confidence threshold"),
+    save_to_firebase: bool = Query(default=True, description="Whether to save results to Firebase if configured."),
+):
+    body = await image.read()
+    return _process_prediction(
+        raw_bytes=body,
+        crop=crop,
+        confidence=confidence,
+        save_to_firebase=save_to_firebase,
+        request_content_type=image.content_type or "",
+    )
 
 
 def _get_severity(confidence: float) -> str:
