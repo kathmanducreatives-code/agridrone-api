@@ -5,7 +5,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,11 +19,14 @@ from inference import (
     debug_path,
     decode_image_bytes,
     ensure_default_model,
+    get_model,
+    loaded_models,
     normalize_crop,
     process_prediction,
     run_inference,
 )
 from report_generator import generate_report
+from storage_helper import StorageDownloadError, download_and_validate_image
 
 load_dotenv()
 
@@ -49,14 +51,25 @@ app.add_middleware(
 
 MAX_CONCURRENT_INFER = max(1, int(os.getenv("MAX_CONCURRENT_INFER", "1")))
 MISSION_ANALYZE_TIMEOUT = float(os.getenv("MISSION_ANALYZE_TIMEOUT_SEC", "0.1"))
-DOWNLOAD_TIMEOUT_SEC = float(os.getenv("DOWNLOAD_TIMEOUT_SEC", "20"))
-MAX_IMAGE_DOWNLOAD_BYTES = int(os.getenv("MAX_IMAGE_DOWNLOAD_BYTES", str(10 * 1024 * 1024)))
 ANALYZE_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_INFER)
 
 
 @app.on_event("startup")
 def startup() -> None:
     ensure_default_model()
+    get_model("rice")
+    logger.info(
+        "startup.models",
+        extra={"models_loaded": sorted(loaded_models.keys()), "max_concurrent_infer": MAX_CONCURRENT_INFER},
+    )
+    if firebase_client.firebase_is_configured():
+        try:
+            firebase_client.get_firebase_app()
+            logger.info("startup.firebase_init", extra={"firebase_configured": True})
+        except Exception as exc:
+            logger.warning("startup.firebase_init_failed: %s", exc)
+    else:
+        logger.info("startup.firebase_init_skipped", extra={"firebase_configured": False})
     logger.info("startup.complete", extra={"max_concurrent_infer": MAX_CONCURRENT_INFER})
 
 
@@ -111,28 +124,6 @@ def _get_existing_mission_or_404(mission_id: str) -> dict[str, Any]:
     if mission is None:
         raise HTTPException(status_code=404, detail=f"Mission '{mission_id}' not found")
     return mission
-
-
-def _download_image_bytes(url: str) -> tuple[bytes, str]:
-    try:
-        with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT_SEC) as response:
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            if not content_type.startswith("image/"):
-                raise ValueError(f"Unexpected content type '{content_type}'")
-
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > MAX_IMAGE_DOWNLOAD_BYTES:
-                    raise ValueError("Image exceeds MAX_IMAGE_DOWNLOAD_BYTES")
-                chunks.append(chunk)
-            return b"".join(chunks), content_type
-    except requests.RequestException as exc:
-        raise ValueError("Image download failed") from exc
 
 
 def _extract_gps(meta: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -210,29 +201,44 @@ def _analyze_mission_sync(mission_id: str) -> dict[str, Any]:
     crop = mission.get("crop", "rice")
     normalized_crop, crop_warning = normalize_crop(crop)
     images = firebase_client.list_mission_images(mission_id)
-    image_candidates = [image for image in images if image.get("url")]
 
     logger.info(
         "mission.analysis_begin",
-        extra={"mission_id": mission_id, "crop": normalized_crop, "image_count": len(image_candidates)},
+        extra={"mission_id": mission_id, "crop": normalized_crop, "image_count": len(images)},
     )
 
-    if not image_candidates:
-        message = "Mission has no uploaded images with storage_url"
+    if not images:
+        message = "Mission has no images to analyze. Add RTDB image records with storage_url first."
         firebase_client.set_mission_status(
             mission_id,
             "error",
-            {"error_code": "no_images", "error_message": message, "updated_at": _utc_now()},
+            {
+                "error_code": "no_images",
+                "error_message": message,
+                "error_reason": message,
+                "updated_at": _utc_now(),
+            },
         )
         raise HTTPException(status_code=400, detail=message)
 
     analyzed_images: list[dict[str, Any]] = []
     failed_images: list[dict[str, Any]] = []
 
-    for image in image_candidates:
+    for image in images:
         image_id = image["imageId"]
+        if not image.get("url"):
+            message = "Mission image is missing storage_url"
+            error_payload = {
+                "status": "error",
+                "error_code": "missing_storage_url",
+                "message": message,
+                "processed_at": _utc_now(),
+            }
+            firebase_client.write_image_result(mission_id, image_id, error_payload)
+            failed_images.append({"imageId": image_id, "error_code": "missing_storage_url", "message": message})
+            continue
         try:
-            raw_bytes, content_type = _download_image_bytes(image["url"])
+            raw_bytes, content_type = download_and_validate_image(image["url"])
             img = decode_image_bytes(raw_bytes)
             detections, primary = run_inference(img, normalized_crop, confidence=0.3)
             yolo_result = {
@@ -257,6 +263,19 @@ def _analyze_mission_sync(mission_id: str) -> dict[str, Any]:
             )
         except HTTPException:
             raise
+        except StorageDownloadError as exc:
+            logger.exception(
+                "mission.image_failed",
+                extra={"mission_id": mission_id, "image_id": image_id, "url": image.get("url")},
+            )
+            error_payload = {
+                "status": "error",
+                "error_code": exc.error_code,
+                "message": exc.message,
+                "processed_at": _utc_now(),
+            }
+            firebase_client.write_image_result(mission_id, image_id, error_payload)
+            failed_images.append({"imageId": image_id, "error_code": exc.error_code, "message": exc.message})
         except Exception as exc:
             logger.exception(
                 "mission.image_failed",
@@ -269,9 +288,9 @@ def _analyze_mission_sync(mission_id: str) -> dict[str, Any]:
                 "processed_at": _utc_now(),
             }
             firebase_client.write_image_result(mission_id, image_id, error_payload)
-            failed_images.append({"imageId": image_id, "message": str(exc)})
+            failed_images.append({"imageId": image_id, "error_code": "image_processing_failed", "message": str(exc)})
 
-    failure_ratio = len(failed_images) / max(len(image_candidates), 1)
+    failure_ratio = len(failed_images) / max(len(images), 1)
     summary = _summarize_results(mission_id, mission, analyzed_images, failed_images)
     summary["failure_ratio"] = round(failure_ratio, 4)
     summary["failed_image_details"] = failed_images
@@ -281,12 +300,14 @@ def _analyze_mission_sync(mission_id: str) -> dict[str, Any]:
     firebase_client.write_mission_report(mission_id, report)
 
     if failure_ratio > 0.3:
+        error_reason = "More than 30% of mission images failed during analysis."
         firebase_client.set_mission_status(
             mission_id,
             "error",
             {
                 "error_code": "too_many_failed_images",
-                "error_message": "More than 30% of mission images failed during analysis.",
+                "error_message": error_reason,
+                "error_reason": error_reason,
                 "updated_at": _utc_now(),
                 "processed_images": summary["processed_images"],
                 "failed_images": summary["failed_images"],
@@ -296,7 +317,13 @@ def _analyze_mission_sync(mission_id: str) -> dict[str, Any]:
             "mission.analysis_error_threshold",
             extra={"mission_id": mission_id, "failure_ratio": failure_ratio},
         )
-        return {"missionId": mission_id, "status": "error", "report": report, "summary": summary}
+        return {
+            "missionId": mission_id,
+            "status": "error",
+            "error_reason": error_reason,
+            "report": report,
+            "summary": summary,
+        }
 
     firebase_client.set_mission_status(
         mission_id,
@@ -425,14 +452,19 @@ async def analyze_mission(mission_id: str):
         firebase_client.set_mission_status(
             mission_id,
             "error",
-            {"error_code": "analysis_failed", "error_message": str(exc.detail), "updated_at": _utc_now()},
+            {
+                "error_code": "analysis_failed",
+                "error_message": str(exc.detail),
+                "error_reason": str(exc.detail),
+                "updated_at": _utc_now(),
+            },
         )
         raise
     except Exception as exc:
         firebase_client.set_mission_status(
             mission_id,
             "error",
-            {"error_code": "analysis_failed", "error_message": str(exc), "updated_at": _utc_now()},
+            {"error_code": "analysis_failed", "error_message": str(exc), "error_reason": str(exc), "updated_at": _utc_now()},
         )
         raise
     if result.get("busy"):

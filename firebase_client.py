@@ -71,6 +71,13 @@ def _db_ref(path: str):
     return db.reference(path, app=app)
 
 
+def get_storage_bucket():
+    from firebase_admin import storage
+
+    app = get_firebase_app()
+    return storage.bucket(app=app)
+
+
 def get_mission(mission_id: str) -> Optional[dict[str, Any]]:
     data = _db_ref(f"/missions/{mission_id}").get()
     return data if isinstance(data, dict) else None
