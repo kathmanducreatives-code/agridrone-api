@@ -1,22 +1,43 @@
+import asyncio
+import logging
 import os
+import uuid
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-import cv2
-import numpy as np
+import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from PIL import Image
-from dotenv import load_dotenv
+from fastapi.responses import FileResponse, JSONResponse
+
+import firebase_client
+from firebase_client import FirebaseConfigError
+from inference import (
+    DEBUG_LATEST_DECODED_IMAGE_URL,
+    DEBUG_LATEST_IMAGE_URL,
+    VALID_CROPS,
+    debug_path,
+    decode_image_bytes,
+    ensure_default_model,
+    normalize_crop,
+    process_prediction,
+    run_inference,
+)
+from report_generator import generate_report
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("agridrone.api")
 
 app = FastAPI(
     title="AgriDrone Guardian API",
     description="AI-powered crop disease detection for Nepali farmers",
-    version="1.0.0"
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -26,230 +47,285 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODELS_DIR = Path(os.getenv("MODELS_DIR", "./models"))
-MODEL_GDRIVE_ID = os.getenv("MODEL_GDRIVE_ID", "").strip()
-DEBUG_DIR = Path(os.getenv("DEBUG_IMAGE_DIR", "./debug"))
-DEBUG_LATEST_IMAGE_URL = "/debug/latest.jpg"
-DEBUG_LATEST_DECODED_IMAGE_URL = "/debug/latest_decoded.jpg"
-VALID_CROPS = ["rice", "wheat", "maize", "potato", "tomato", "pepper"]
+MAX_CONCURRENT_INFER = max(1, int(os.getenv("MAX_CONCURRENT_INFER", "1")))
+MISSION_ANALYZE_TIMEOUT = float(os.getenv("MISSION_ANALYZE_TIMEOUT_SEC", "0.1"))
+DOWNLOAD_TIMEOUT_SEC = float(os.getenv("DOWNLOAD_TIMEOUT_SEC", "20"))
+MAX_IMAGE_DOWNLOAD_BYTES = int(os.getenv("MAX_IMAGE_DOWNLOAD_BYTES", str(10 * 1024 * 1024)))
+ANALYZE_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_INFER)
 
-def _download_model_from_gdrive(model_path: Path) -> bool:
-    """Downloads the model file from Google Drive if MODEL_GDRIVE_ID is set."""
-    if not MODEL_GDRIVE_ID:
-        print("⚠️ MODEL_GDRIVE_ID not set; skipping model download.")
-        return False
-        
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Standard Google Drive download URL format for gdown
-    url = f"https://drive.google.com/uc?id={MODEL_GDRIVE_ID}"
-    
-    try:
-        import gdown
-        print(f"⬇️ Downloading model from Google Drive (ID: {MODEL_GDRIVE_ID}) to {model_path} ...")
-        # Ensure we download to the exact path
-        output = gdown.download(url, str(model_path), quiet=False)
-        
-        if output and Path(output).exists():
-            print(f"✅ Model downloaded successfully to {model_path}")
-            return True
-        else:
-            print(f"❌ Download failed: Output file not found.")
-            return False
-    except Exception as exc:
-        print(f"❌ Failed to download model: {exc}")
-        return False
 
 @app.on_event("startup")
-def _startup_download_model():
-    rice_model = MODELS_DIR / "rice_disease_best.onnx"
-    if not rice_model.exists():
-        _download_model_from_gdrive(rice_model)
+def startup() -> None:
+    ensure_default_model()
+    logger.info("startup.complete", extra={"max_concurrent_infer": MAX_CONCURRENT_INFER})
 
-# Load models into memory at startup — one per crop
-loaded_models = {}
 
-def get_model(crop: str):
-    if crop in loaded_models:
-        return loaded_models[crop]
-    
-    # Try ONNX first (faster on CPU), fall back to .pt
-    onnx_path = MODELS_DIR / f"{crop}_disease_best.onnx"
-    pt_path   = MODELS_DIR / f"{crop}_disease_best.pt"
-    
-    if onnx_path.exists():
-        from ultralytics import YOLO
-        model = YOLO(str(onnx_path), task='detect')
-        loaded_models[crop] = model
-        print(f"✅ Loaded {crop} model from {onnx_path}")
-        return model
-    elif pt_path.exists():
-        from ultralytics import YOLO
-        model = YOLO(str(pt_path))
-        loaded_models[crop] = model
-        print(f"✅ Loaded {crop} model from {pt_path}")
-        return model
-    else:
-        return None
+@app.exception_handler(FirebaseConfigError)
+async def firebase_config_exception_handler(_: Request, exc: FirebaseConfigError):
+    return JSONResponse(
+        status_code=503,
+        content={"error_code": "firebase_not_configured", "message": str(exc)},
+    )
 
 
 @app.get("/")
+@app.head("/")
 def root():
     return {
         "status": "AgriDrone Guardian API is running",
-        "version": "1.0.0",
-        "crops_supported": ["rice", "wheat", "maize", "potato", "tomato", "pepper"]
+        "version": "1.1.0",
+        "crops_supported": VALID_CROPS,
     }
 
 
 @app.get("/health")
 def health():
+    from inference import MODELS_DIR, loaded_models
+
     models_loaded = list(loaded_models.keys())
     available_models = []
     for crop in VALID_CROPS:
         onnx = MODELS_DIR / f"{crop}_disease_best.onnx"
-        pt   = MODELS_DIR / f"{crop}_disease_best.pt"
+        pt = MODELS_DIR / f"{crop}_disease_best.pt"
         if onnx.exists() or pt.exists():
             available_models.append(crop)
     return {
         "status": "healthy",
         "models_loaded": models_loaded,
-        "models_available": available_models
+        "models_available": available_models,
+        "firebase_configured": firebase_client.firebase_is_configured(),
+        "max_concurrent_infer": MAX_CONCURRENT_INFER,
     }
 
 
-def _normalize_crop(crop: str) -> tuple[str, Optional[str]]:
-    normalized_crop = (crop or "rice").strip().lower()
-    if normalized_crop in VALID_CROPS:
-        return normalized_crop, None
-    return "rice", f"Unsupported crop '{crop}'. Falling back to 'rice'."
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _decode_raw_image(body: bytes) -> Image.Image:
-    if not body:
-        raise HTTPException(status_code=400, detail="Request body is empty")
-
-    np_buffer = np.frombuffer(body, np.uint8)
-    frame = cv2.imdecode(np_buffer, cv2.IMREAD_COLOR)
-    if frame is None:
-        raise HTTPException(status_code=400, detail="Failed to decode JPEG image from request body")
-
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb_frame)
+def _mission_error_response(status_code: int, error_code: str, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"error_code": error_code, "message": message})
 
 
-def _debug_path(name: str) -> Path:
-    return DEBUG_DIR / name
+def _get_existing_mission_or_404(mission_id: str) -> dict[str, Any]:
+    mission = firebase_client.get_mission(mission_id)
+    if mission is None:
+        raise HTTPException(status_code=404, detail=f"Mission '{mission_id}' not found")
+    return mission
 
 
-def _save_debug_images(raw_bytes: bytes, img: Image.Image) -> bool:
+def _download_image_bytes(url: str) -> tuple[bytes, str]:
     try:
-        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT_SEC) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not content_type.startswith("image/"):
+                raise ValueError(f"Unexpected content type '{content_type}'")
 
-        _debug_path(f"{stamp}.jpg").write_bytes(raw_bytes)
-        _debug_path("latest.jpg").write_bytes(raw_bytes)
-
-        decoded_path = _debug_path(f"{stamp}_decoded.jpg")
-        latest_decoded_path = _debug_path("latest_decoded.jpg")
-        img.save(decoded_path, format="JPEG")
-        img.save(latest_decoded_path, format="JPEG")
-        return True
-    except Exception as exc:
-        print(f"⚠️ Failed to save debug images: {exc}")
-        return False
-
-
-def _run_inference(img: Image.Image, crop: str, confidence: float) -> tuple[list[dict], Optional[dict]]:
-    model = get_model(crop)
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Model for '{crop}' not available yet. Training in progress."
-        )
-
-    results = model(img, conf=confidence)[0]
-
-    detections = []
-    if results.boxes and len(results.boxes) > 0:
-        for box in results.boxes:
-            class_id = int(box.cls[0])
-            conf_score = float(box.conf[0])
-            class_name = results.names[class_id]
-            bbox = box.xyxy[0].tolist()
-
-            detections.append({
-                "disease": class_name,
-                "confidence": round(conf_score, 4),
-                "bbox": [round(x, 2) for x in bbox],
-                "severity": _get_severity(conf_score)
-            })
-
-    detections.sort(key=lambda x: x["confidence"], reverse=True)
-    primary = detections[0] if detections else None
-    return detections, primary
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_IMAGE_DOWNLOAD_BYTES:
+                    raise ValueError("Image exceeds MAX_IMAGE_DOWNLOAD_BYTES")
+                chunks.append(chunk)
+            return b"".join(chunks), content_type
+    except requests.RequestException as exc:
+        raise ValueError("Image download failed") from exc
 
 
-def _build_prediction_response(
-    *,
-    crop: str,
-    crop_requested: str,
-    crop_warning: Optional[str],
-    img: Image.Image,
-    detections: list[dict],
-    primary: Optional[dict],
-    request_content_type: str,
-    save_to_firebase: bool,
-    debug_saved: bool,
-) -> dict:
+def _extract_gps(meta: dict[str, Any]) -> Optional[dict[str, Any]]:
+    gps = meta.get("gps")
+    return gps if isinstance(gps, dict) else None
+
+
+def _summarize_results(
+    mission_id: str,
+    mission: dict[str, Any],
+    analyzed_images: list[dict[str, Any]],
+    failed_images: list[dict[str, Any]],
+) -> dict[str, Any]:
+    counts_per_disease: dict[str, int] = {}
+    severity_distribution: dict[str, int] = {}
+    confidence_sums: dict[str, float] = {}
+    confidence_counts: dict[str, int] = {}
+    images_with_detections = 0
+    top_severe_detections: list[dict[str, Any]] = []
+
+    for image in analyzed_images:
+        detections = image.get("detections", [])
+        if detections:
+            images_with_detections += 1
+        for detection in detections:
+            disease = detection["disease"]
+            severity = detection["severity"]
+            confidence = float(detection["confidence"])
+            counts_per_disease[disease] = counts_per_disease.get(disease, 0) + 1
+            severity_distribution[severity] = severity_distribution.get(severity, 0) + 1
+            confidence_sums[disease] = confidence_sums.get(disease, 0.0) + confidence
+            confidence_counts[disease] = confidence_counts.get(disease, 0) + 1
+            top_severe_detections.append(
+                {
+                    "imageId": image["imageId"],
+                    "disease": disease,
+                    "confidence": round(confidence, 4),
+                    "severity": severity,
+                    "gps": image.get("gps"),
+                    "timestamp": image.get("timestamp"),
+                }
+            )
+
+    top_severe_detections.sort(
+        key=lambda item: (
+            ["trace", "mild", "moderate", "severe"].index(item["severity"]),
+            item["confidence"],
+        ),
+        reverse=True,
+    )
+    average_confidence_per_disease = {
+        disease: round(confidence_sums[disease] / confidence_counts[disease], 4)
+        for disease in confidence_sums
+    }
+
+    hotspot_candidates = [item for item in top_severe_detections if item.get("gps")][:5]
+
     return {
-        "status": "success",
-        "crop": crop,
-        "crop_requested": crop_requested,
-        "crop_warning": crop_warning,
-        "disease": primary["disease"] if primary else "Healthy",
-        "confidence": primary["confidence"] if primary else 1.0,
-        "severity": primary["severity"] if primary else "none",
-        "all_detections": detections,
-        "image_size": {"width": img.width, "height": img.height},
-        "model": f"{crop}_disease",
-        "save_to_firebase_requested": save_to_firebase,
-        "firebase_saved": False,
-        "debug_saved": debug_saved,
-        "debug_latest_image_url": DEBUG_LATEST_IMAGE_URL,
-        "debug_latest_decoded_image_url": DEBUG_LATEST_DECODED_IMAGE_URL,
-        "request_content_type": request_content_type,
+        "mission_id": mission_id,
+        "crop": mission.get("crop", "rice"),
+        "processed_images": len(analyzed_images),
+        "failed_images": len(failed_images),
+        "images_with_detections": images_with_detections,
+        "counts_per_disease": counts_per_disease,
+        "severity_distribution": severity_distribution,
+        "average_confidence_per_disease": average_confidence_per_disease,
+        "top_severe_detections": top_severe_detections[:5],
+        "hotspot_candidates": hotspot_candidates,
+        "generated_at": _utc_now(),
     }
 
 
-def _process_prediction(
-    *,
-    raw_bytes: bytes,
-    crop: str,
-    confidence: float,
-    save_to_firebase: bool,
-    request_content_type: str,
-) -> dict:
-    normalized_crop, crop_warning = _normalize_crop(crop)
-    img = _decode_raw_image(raw_bytes)
-    detections, primary = _run_inference(img, normalized_crop, confidence)
-    debug_saved = _save_debug_images(raw_bytes, img)
-    return _build_prediction_response(
-        crop=normalized_crop,
-        crop_requested=crop,
-        crop_warning=crop_warning,
-        img=img,
-        detections=detections,
-        primary=primary,
-        request_content_type=request_content_type,
-        save_to_firebase=save_to_firebase,
-        debug_saved=debug_saved,
+def _analyze_mission_sync(mission_id: str) -> dict[str, Any]:
+    mission = _get_existing_mission_or_404(mission_id)
+    crop = mission.get("crop", "rice")
+    normalized_crop, crop_warning = normalize_crop(crop)
+    images = firebase_client.list_mission_images(mission_id)
+    image_candidates = [image for image in images if image.get("url")]
+
+    logger.info(
+        "mission.analysis_begin",
+        extra={"mission_id": mission_id, "crop": normalized_crop, "image_count": len(image_candidates)},
     )
+
+    if not image_candidates:
+        message = "Mission has no uploaded images with storage_url"
+        firebase_client.set_mission_status(
+            mission_id,
+            "error",
+            {"error_code": "no_images", "error_message": message, "updated_at": _utc_now()},
+        )
+        raise HTTPException(status_code=400, detail=message)
+
+    analyzed_images: list[dict[str, Any]] = []
+    failed_images: list[dict[str, Any]] = []
+
+    for image in image_candidates:
+        image_id = image["imageId"]
+        try:
+            raw_bytes, content_type = _download_image_bytes(image["url"])
+            img = decode_image_bytes(raw_bytes)
+            detections, primary = run_inference(img, normalized_crop, confidence=0.3)
+            yolo_result = {
+                "status": "success",
+                "crop": normalized_crop,
+                "crop_warning": crop_warning,
+                "timestamp": image.get("timestamp"),
+                "content_type": content_type,
+                "image_size": {"width": img.width, "height": img.height},
+                "detections": detections,
+                "primary_detection": primary,
+                "processed_at": _utc_now(),
+            }
+            firebase_client.write_image_result(mission_id, image_id, yolo_result)
+            analyzed_images.append(
+                {
+                    "imageId": image_id,
+                    "timestamp": image.get("timestamp"),
+                    "gps": _extract_gps(image.get("meta", {})),
+                    "detections": detections,
+                }
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "mission.image_failed",
+                extra={"mission_id": mission_id, "image_id": image_id, "url": image.get("url")},
+            )
+            error_payload = {
+                "status": "error",
+                "error_code": "image_processing_failed",
+                "message": str(exc),
+                "processed_at": _utc_now(),
+            }
+            firebase_client.write_image_result(mission_id, image_id, error_payload)
+            failed_images.append({"imageId": image_id, "message": str(exc)})
+
+    failure_ratio = len(failed_images) / max(len(image_candidates), 1)
+    summary = _summarize_results(mission_id, mission, analyzed_images, failed_images)
+    summary["failure_ratio"] = round(failure_ratio, 4)
+    summary["failed_image_details"] = failed_images
+
+    report = generate_report(summary, {"missionId": mission_id, **mission})
+    firebase_client.write_mission_summary(mission_id, summary)
+    firebase_client.write_mission_report(mission_id, report)
+
+    if failure_ratio > 0.3:
+        firebase_client.set_mission_status(
+            mission_id,
+            "error",
+            {
+                "error_code": "too_many_failed_images",
+                "error_message": "More than 30% of mission images failed during analysis.",
+                "updated_at": _utc_now(),
+                "processed_images": summary["processed_images"],
+                "failed_images": summary["failed_images"],
+            },
+        )
+        logger.error(
+            "mission.analysis_error_threshold",
+            extra={"mission_id": mission_id, "failure_ratio": failure_ratio},
+        )
+        return {"missionId": mission_id, "status": "error", "report": report, "summary": summary}
+
+    firebase_client.set_mission_status(
+        mission_id,
+        "done",
+        {
+            "updated_at": _utc_now(),
+            "processed_images": summary["processed_images"],
+            "failed_images": summary["failed_images"],
+        },
+    )
+    logger.info("mission.analysis_complete", extra={"mission_id": mission_id, "processed": len(analyzed_images)})
+    return {"missionId": mission_id, "status": "done", "report": report, "summary": summary}
+
+
+async def _run_mission_analysis(mission_id: str) -> dict[str, Any]:
+    try:
+        await asyncio.wait_for(ANALYZE_SEMAPHORE.acquire(), timeout=MISSION_ANALYZE_TIMEOUT)
+    except TimeoutError:
+        return {"busy": True}
+
+    try:
+        return await asyncio.to_thread(_analyze_mission_sync, mission_id)
+    finally:
+        ANALYZE_SEMAPHORE.release()
 
 
 @app.get(DEBUG_LATEST_IMAGE_URL)
 def debug_latest_image():
-    latest_path = _debug_path("latest.jpg")
+    latest_path = debug_path("latest.jpg")
     if not latest_path.exists():
         raise HTTPException(status_code=404, detail="No debug image has been saved yet.")
     return FileResponse(latest_path, media_type="image/jpeg")
@@ -257,7 +333,7 @@ def debug_latest_image():
 
 @app.get(DEBUG_LATEST_DECODED_IMAGE_URL)
 def debug_latest_decoded_image():
-    latest_decoded_path = _debug_path("latest_decoded.jpg")
+    latest_decoded_path = debug_path("latest_decoded.jpg")
     if not latest_decoded_path.exists():
         raise HTTPException(status_code=404, detail="No decoded debug image has been saved yet.")
     return FileResponse(latest_decoded_path, media_type="image/jpeg")
@@ -268,10 +344,10 @@ async def predict(
     request: Request,
     crop: str = Query(default="rice", description="Crop type: rice, wheat, maize, potato, tomato, pepper"),
     confidence: float = Query(default=0.3, description="Minimum confidence threshold"),
-    save_to_firebase: bool = Query(default=True, description="Whether to save results to Firebase if configured.")
+    save_to_firebase: bool = Query(default=True, description="Whether to save results to Firebase if configured."),
 ):
     body = await request.body()
-    return _process_prediction(
+    return process_prediction(
         raw_bytes=body,
         crop=crop,
         confidence=confidence,
@@ -281,6 +357,7 @@ async def predict(
 
 
 @app.post("/predict_form")
+@app.post("/predict_upload")
 async def predict_form(
     image: UploadFile = File(...),
     crop: str = Query(default="rice", description="Crop type: rice, wheat, maize, potato, tomato, pepper"),
@@ -288,7 +365,7 @@ async def predict_form(
     save_to_firebase: bool = Query(default=True, description="Whether to save results to Firebase if configured."),
 ):
     body = await image.read()
-    return _process_prediction(
+    return process_prediction(
         raw_bytes=body,
         crop=crop,
         confidence=confidence,
@@ -297,17 +374,94 @@ async def predict_form(
     )
 
 
-def _get_severity(confidence: float) -> str:
-    if confidence >= 0.85:
-        return "severe"
-    elif confidence >= 0.60:
-        return "moderate"
-    elif confidence >= 0.30:
-        return "mild"
-    else:
-        return "trace"
+@app.post("/missions")
+async def create_mission(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    crop = payload.get("crop", "rice")
+    normalized_crop, crop_warning = normalize_crop(crop)
+    mission_id = str(uuid.uuid4())
+    mission_payload = {
+        "missionId": mission_id,
+        "status": "capturing",
+        "crop": normalized_crop,
+        "crop_requested": crop,
+        "crop_warning": crop_warning,
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+        "capture_interval_ms": payload.get("capture_interval_ms"),
+        "notes": payload.get("notes"),
+        "analyze_now": False,
+    }
+    firebase_client.create_mission(mission_id, mission_payload)
+    logger.info("mission.created", extra={"mission_id": mission_id, "crop": normalized_crop})
+    return {"missionId": mission_id, "status": "capturing", "crop": normalized_crop}
+
+
+@app.get("/missions/{mission_id}")
+async def get_mission(mission_id: str):
+    mission = _get_existing_mission_or_404(mission_id)
+    return mission
+
+
+@app.post("/missions/{mission_id}/analyze")
+async def analyze_mission(mission_id: str):
+    mission = _get_existing_mission_or_404(mission_id)
+    current_status = mission.get("status")
+    if current_status == "processing":
+        return _mission_error_response(409, "analysis_in_progress", "analysis in progress")
+
+    firebase_client.set_mission_status(
+        mission_id,
+        "processing",
+        {"analyze_now": True, "updated_at": _utc_now()},
+    )
+
+    try:
+        result = await _run_mission_analysis(mission_id)
+    except HTTPException as exc:
+        firebase_client.set_mission_status(
+            mission_id,
+            "error",
+            {"error_code": "analysis_failed", "error_message": str(exc.detail), "updated_at": _utc_now()},
+        )
+        raise
+    except Exception as exc:
+        firebase_client.set_mission_status(
+            mission_id,
+            "error",
+            {"error_code": "analysis_failed", "error_message": str(exc), "updated_at": _utc_now()},
+        )
+        raise
+    if result.get("busy"):
+        firebase_client.set_mission_status(
+            mission_id,
+            current_status or "uploaded",
+            {"updated_at": _utc_now()},
+        )
+        return _mission_error_response(409, "analysis_in_progress", "analysis in progress")
+    return result
+
+
+@app.middleware("http")
+async def add_default_json_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except FirebaseConfigError:
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("request.unhandled_exception", extra={"path": request.url.path})
+        return JSONResponse(
+            status_code=500,
+            content={"error_code": "internal_error", "message": str(exc)},
+        )
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
+
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True, workers=1)

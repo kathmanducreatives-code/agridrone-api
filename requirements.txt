@@ -1,7 +1,13 @@
 fastapi==0.115.0
 uvicorn==0.30.6
 python-multipart==0.0.9
-pillow==10.4.0
+pillow==11.3.0
 python-dotenv==1.0.1
 ultralytics==8.3.33
 gdown==5.2.0
+requests==2.32.3
+firebase-admin==6.6.0
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+pytest==8.3.3
+httpx==0.28.1

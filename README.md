@@ -1,27 +1,23 @@
 # AgriDrone API
 
-## Raw ESP32 Upload
+Mission-based batch backend for AgriDrone Guardian, with backward-compatible raw-image inference endpoints.
 
-`POST /predict` accepts raw JPEG bytes in the request body.
+## Docs
 
-```bash
-curl -X POST "http://localhost:8000/predict?crop=rice&save_to_firebase=true" \
-  -H "Content-Type: image/jpeg" \
-  --data-binary @leaf.jpg
-```
+- Operator and developer workflow: [AGENTS.md](/Users/prasidha/screeningpilot/screeningpilot/agridrone-api/AGENTS.md)
 
-## Browser/UI Upload
+## Backward-Compatible Endpoints
 
-`POST /predict_form` accepts `multipart/form-data` with a required `image` field for manual testing from the browser, frontend, or Swagger UI.
+- `POST /predict`: raw JPEG request body
+- `POST /predict_form`: multipart upload for browser/manual testing
+- `POST /predict_upload`: alias for Swagger/manual multipart testing
+- `GET /health`: model and runtime health
+- `GET /`: root probe endpoint, also supports `HEAD`
 
-## Debug Image Inspection
+## Mission Endpoints
 
-Every successful prediction saves lightweight debug copies locally:
-- `/debug/latest.jpg` serves the latest raw JPEG received by the API
-- `/debug/latest_decoded.jpg` serves the latest decoded JPEG saved after parsing
+- `POST /missions`
+- `GET /missions/{missionId}`
+- `POST /missions/{missionId}/analyze`
 
-Notes:
-- `/predict` remains raw-body only and does not require `multipart/form-data`.
-- Invalid `crop` values fall back to `rice`.
-- Empty bodies and invalid JPEG payloads return `400`.
-- `save_to_firebase` is kept for compatibility; if Firebase is not configured in this repo the response reports `firebase_saved: false`.
+Use [AGENTS.md](/Users/prasidha/screeningpilot/screeningpilot/agridrone-api/AGENTS.md) for local run commands, Render deployment, required environment variables, and smoke tests.
