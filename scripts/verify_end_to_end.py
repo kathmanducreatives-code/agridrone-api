@@ -93,7 +93,7 @@ def _upload_images_and_seed_rtdb(mission_id: str, image_paths: list[Path]) -> li
             },
         }
         try:
-            firebase_client._db_ref(f"/missions/{mission_id}/images/{image_id}").set(payload)
+            firebase_client.write_mission_image_record(mission_id, image_id, payload)
         except Exception as exc:
             raise RuntimeError(f"Failed to write RTDB image record for {image_id}: {exc}") from exc
         uploaded.append({"imageId": image_id, "storage_path": blob.name, "storage_url": download_url})

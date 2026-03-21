@@ -118,6 +118,10 @@ def write_image_result(mission_id: str, image_id: str, yolo_result_json: dict[st
     _db_ref(f"/missions/{mission_id}/images/{image_id}/yolo").set(yolo_result_json)
 
 
+def write_mission_image_record(mission_id: str, image_id: str, image_record: dict[str, Any]) -> None:
+    _db_ref(f"/missions/{mission_id}/images/{image_id}").set(image_record)
+
+
 def write_mission_report(mission_id: str, report_json: dict[str, Any]) -> None:
     _db_ref(f"/missions/{mission_id}/report").set(report_json)
 

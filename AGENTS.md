@@ -13,10 +13,10 @@ pip install -r requirements.txt
 ```
 2. Set environment variables:
 ```bash
-export FIREBASE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
-export FIREBASE_DATABASE_URL='https://<project>.firebaseio.com'
-export FIREBASE_STORAGE_BUCKET='<project>.appspot.com'
-export FIREBASE_PROJECT_ID='<project-id>'
+export FIREBASE_DATABASE_URL='https://agridrone-guardian-default-rtdb.asia-southeast1.firebasedatabase.app'
+export FIREBASE_STORAGE_BUCKET='agridrone-guardian.appspot.com'
+export FIREBASE_SERVICE_ACCOUNT_JSON='<paste the single-line service account JSON for firebase-adminsdk-fbsvc@agridrone-guardian.iam.gserviceaccount.com>'
+export FIREBASE_PROJECT_ID='agridrone-guardian'
 export MAX_CONCURRENT_INFER=1
 ```
 3. Start the API:
@@ -27,9 +27,10 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 ## Required Environment Variables
 
 - `FIREBASE_DATABASE_URL`: Firebase Realtime Database base URL.
-- `FIREBASE_STORAGE_BUCKET`: Firebase Storage bucket name.
-- `FIREBASE_SERVICE_ACCOUNT_JSON`: Full Firebase Admin service account JSON string.
-- `FIREBASE_PROJECT_ID`: Optional when using application default credentials; also useful for logging.
+- `FIREBASE_DATABASE_URL`: `https://agridrone-guardian-default-rtdb.asia-southeast1.firebasedatabase.app`
+- `FIREBASE_STORAGE_BUCKET`: `agridrone-guardian.appspot.com`
+- `FIREBASE_SERVICE_ACCOUNT_JSON`: Full single-line Firebase Admin service account JSON for `firebase-adminsdk-fbsvc@agridrone-guardian.iam.gserviceaccount.com`
+- `FIREBASE_PROJECT_ID`: `agridrone-guardian`
 - `MAX_CONCURRENT_INFER`: Defaults to `1`; keep it at `1` on Render.
 - `MODEL_GDRIVE_ID`: Optional bootstrap path for downloading the rice ONNX model on startup.
 - `MODELS_DIR`: Optional model directory, defaults to `./models`.
@@ -45,11 +46,16 @@ uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
 ```
 - Keep the Render instance on one worker and `MAX_CONCURRENT_INFER=1` to avoid free-tier memory spikes.
 - Set these Render environment variables:
-  - `FIREBASE_SERVICE_ACCOUNT_JSON`
-  - `FIREBASE_DATABASE_URL`
-  - `FIREBASE_STORAGE_BUCKET`
-  - `FIREBASE_PROJECT_ID` (optional)
+  - `FIREBASE_DATABASE_URL=https://agridrone-guardian-default-rtdb.asia-southeast1.firebasedatabase.app`
+  - `FIREBASE_STORAGE_BUCKET=agridrone-guardian.appspot.com`
+  - `FIREBASE_SERVICE_ACCOUNT_JSON=<paste the single-line service account JSON for firebase-adminsdk-fbsvc@agridrone-guardian.iam.gserviceaccount.com>`
+  - `FIREBASE_PROJECT_ID=agridrone-guardian`
   - `MAX_CONCURRENT_INFER=1`
+- Deploy checklist:
+  - Confirm start command is `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1`
+  - Confirm only one Render web worker is running
+  - Confirm all Firebase env vars are present in the Render dashboard
+  - Deploy and wait for `/health` to return `200`
 
 ## Smoke Tests
 
@@ -104,11 +110,11 @@ The verification script uploads local JPG files to Firebase Storage under `missi
 - `pip install -r requirements.txt`
 - `pytest -q`
 - `curl /health`
-- `Create mission with POST /missions`
-- `Add RTDB image records with storage_url`
-- `Run POST /missions/{missionId}/analyze`
-- `Confirm RTDB writes images/*/yolo, summary, report, and final status`
-- `Deploy to Render with --workers 1 and MAX_CONCURRENT_INFER=1`
+- `POST /missions (create mission)`
+- `upload 1–3 images to Firebase Storage under missions/{missionId}/`
+- `write RTDB: /missions/{missionId}/images/{imageId}/storage_url`
+- `POST /missions/{missionId}/analyze`
+- `confirm RTDB writes yolo, summary, report, status done`
 
 ## How To Verify
 
@@ -118,9 +124,10 @@ cd /Users/prasidha/screeningpilot/screeningpilot/agridrone-api
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export FIREBASE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
-export FIREBASE_DATABASE_URL='https://<project>.firebaseio.com'
-export FIREBASE_STORAGE_BUCKET='<project>.appspot.com'
+export FIREBASE_DATABASE_URL='https://agridrone-guardian-default-rtdb.asia-southeast1.firebasedatabase.app'
+export FIREBASE_STORAGE_BUCKET='agridrone-guardian.appspot.com'
+export FIREBASE_SERVICE_ACCOUNT_JSON='<paste the single-line service account JSON for firebase-adminsdk-fbsvc@agridrone-guardian.iam.gserviceaccount.com>'
+export FIREBASE_PROJECT_ID='agridrone-guardian'
 export MAX_CONCURRENT_INFER=1
 pytest -q
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
@@ -132,7 +139,8 @@ curl -s http://localhost:8000/health
 python scripts/verify_end_to_end.py \
   --base-url http://localhost:8000 \
   --crop rice \
-  --image /absolute/path/to/test1.jpg
+  --image ./test1.jpg \
+  --image ./test2.jpg
 ```
 
 Render deploy:
@@ -140,12 +148,22 @@ Render deploy:
 uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
 ```
 
+Render environment values:
+```bash
+FIREBASE_DATABASE_URL=https://agridrone-guardian-default-rtdb.asia-southeast1.firebasedatabase.app
+FIREBASE_STORAGE_BUCKET=agridrone-guardian.appspot.com
+FIREBASE_SERVICE_ACCOUNT_JSON=<paste the single-line service account JSON for firebase-adminsdk-fbsvc@agridrone-guardian.iam.gserviceaccount.com>
+FIREBASE_PROJECT_ID=agridrone-guardian
+MAX_CONCURRENT_INFER=1
+```
+
 Render verification:
 ```bash
 python scripts/verify_end_to_end.py \
   --base-url https://agridrone-api.onrender.com \
   --crop rice \
-  --image /absolute/path/to/test1.jpg
+  --image ./test1.jpg \
+  --image ./test2.jpg
 ```
 
 ## Development Rules
