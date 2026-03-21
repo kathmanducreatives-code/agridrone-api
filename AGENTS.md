@@ -44,6 +44,12 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
 ```
 - Keep the Render instance on one worker and `MAX_CONCURRENT_INFER=1` to avoid free-tier memory spikes.
+- Set these Render environment variables:
+  - `FIREBASE_SERVICE_ACCOUNT_JSON`
+  - `FIREBASE_DATABASE_URL`
+  - `FIREBASE_STORAGE_BUCKET`
+  - `FIREBASE_PROJECT_ID` (optional)
+  - `MAX_CONCURRENT_INFER=1`
 
 ## Smoke Tests
 
@@ -80,6 +86,66 @@ curl -X POST "http://localhost:8000/missions/<missionId>/analyze"
 Mission fetch:
 ```bash
 curl -s "http://localhost:8000/missions/<missionId>"
+```
+
+Verification script:
+```bash
+python scripts/verify_end_to_end.py \
+  --base-url http://localhost:8000 \
+  --crop rice \
+  --image /absolute/path/to/test1.jpg \
+  --image /absolute/path/to/test2.jpg
+```
+
+The verification script uploads local JPG files to Firebase Storage under `missions/{missionId}/`, writes RTDB image records with `storage_url`, runs mission analysis, polls for completion, and prints a final `PASS` or `FAIL` summary.
+
+## Verification Checklist
+
+- `pip install -r requirements.txt`
+- `pytest -q`
+- `curl /health`
+- `Create mission with POST /missions`
+- `Add RTDB image records with storage_url`
+- `Run POST /missions/{missionId}/analyze`
+- `Confirm RTDB writes images/*/yolo, summary, report, and final status`
+- `Deploy to Render with --workers 1 and MAX_CONCURRENT_INFER=1`
+
+## How To Verify
+
+Local environment:
+```bash
+cd /Users/prasidha/screeningpilot/screeningpilot/agridrone-api
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+export FIREBASE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
+export FIREBASE_DATABASE_URL='https://<project>.firebaseio.com'
+export FIREBASE_STORAGE_BUCKET='<project>.appspot.com'
+export MAX_CONCURRENT_INFER=1
+pytest -q
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+Local verification against localhost:
+```bash
+curl -s http://localhost:8000/health
+python scripts/verify_end_to_end.py \
+  --base-url http://localhost:8000 \
+  --crop rice \
+  --image /absolute/path/to/test1.jpg
+```
+
+Render deploy:
+```bash
+uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+```
+
+Render verification:
+```bash
+python scripts/verify_end_to_end.py \
+  --base-url https://agridrone-api.onrender.com \
+  --crop rice \
+  --image /absolute/path/to/test1.jpg
 ```
 
 ## Development Rules
