@@ -662,6 +662,7 @@ async def predict_form(
         source_label=image.filename or "upload",
     )
 
+    detections, primary = await run_inference(img_np, crop, confidence)
 
 @app.post("/v1/inferences/esp32-snapshot", response_model=InferenceRecordResponse)
 async def infer_esp32_snapshot(payload: Esp32SnapshotInferenceRequest):
