@@ -1,6 +1,52 @@
 services:
   - type: web
     name: agridrone-api
-    runtime: python3
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    envVars:
+      - key: PRODUCTION_BACKEND_PROVIDER
+        value: supabase
+      - key: MAX_CONCURRENT_INFER
+        value: "1"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: Crop-photos
+      - key: MODELS_DIR
+        value: ./models
+      - key: REDIS_URL
+        fromService:
+          name: agridrone-redis
+          type: keyvalue
+          property: connectionString
+
+  - type: worker
+    name: agridrone-worker
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    envVars:
+      - key: PRODUCTION_BACKEND_PROVIDER
+        value: supabase
+      - key: MAX_CONCURRENT_INFER
+        value: "1"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: Crop-photos
+      - key: MODELS_DIR
+        value: ./models
+      - key: REDIS_URL
+        fromService:
+          name: agridrone-redis
+          type: keyvalue
+          property: connectionString
+
+  - type: keyvalue
+    name: agridrone-redis
+    ipAllowList: []
